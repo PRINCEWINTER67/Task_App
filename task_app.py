@@ -7,8 +7,19 @@ system (Wood -> Void), and a big Market/Customize cosmetics system.
 
 HOW TO RUN:
 1. pip install customtkinter pyserial   (only needed once)
-2. Arduino plugged in with task_light.ino uploaded
+2. Arduino plugged in with task_light/task_light.ino uploaded
 3. python task_app.py
+
+ARDUINO HARDWARE PANEL:
+- 4 status LEDs (red/yellow/blue/green): red solid = a task is due within
+  the hour (or overdue), red blink = due later today, blue = nearest task
+  due tomorrow, yellow = nearest task due later than tomorrow, green =
+  nothing pending.
+- 4-digit 7-segment display (74HC595 + transistors): live count of pending
+  (not-done) tasks.
+- 16x2 LCD + button: press the button to cycle through the pending task
+  list (name + due date/time), one task per press.
+See task_light/task_light.ino for the full serial protocol and wiring.
 
 WHAT'S NEW IN THIS VERSION:
 - Player Level system: XP -> Level -> Tier (Wood through Void), shown in the
@@ -35,7 +46,8 @@ import os
 import math
 import random
 import colorsys
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timedelta
 from typing import Optional, Tuple
 
 # ============================================================
@@ -415,6 +427,10 @@ def connect_arduino() -> None:
     try:
         import serial
         arduino = serial.Serial(settings["arduino_port"], ARDUINO_BAUD, timeout=1)
+        # Opening the port reboots an Uno/Nano (auto-reset via DTR), and the
+        # bootloader eats anything sent in the first ~1-2s - so give it a
+        # moment before we start pushing light/counter/task data at it.
+        time.sleep(2)
         print(f"Connected to Arduino on {settings['arduino_port']}")
     except Exception as e:
         arduino = None
@@ -481,15 +497,80 @@ def parse_time_input(text: str) -> Optional[str]:
     except ValueError:
         return None
 
+def send_line_to_arduino(line: str) -> None:
+    send_to_arduino(line + "\n")
+
+# ============================================================
+# ARDUINO HARDWARE PANEL (lights, 7-segment counter, LCD task list)
+# Separate from the on-screen urgency tiers (get_tier/TIER_COLORS) above -
+# the physical light escalates by literal time-to-due rather than the
+# app's day-bucketed dots, so "due within the hour" can outrank "due
+# today" even though both would show as the same red dot on screen.
+# ============================================================
+HW_MAX_LCD_TASKS = 6
+HW_URGENT_WINDOW = timedelta(hours=1)
+HW_LIGHT_PRIORITY = ["solid", "blink", "blue", "yellow"]  # first match wins
+HW_LIGHT_CODE = {"solid": "0", "blink": "1", "blue": "2", "yellow": "3"}
+HW_LIGHT_CODE_GREEN = "4"
+
+def get_hardware_urgency(task: dict) -> str:
+    """Physical-light bucket for one not-done task: 'solid' (due within the
+    next hour, or overdue), 'blink' (due later today), 'blue' (due
+    tomorrow), or 'yellow' (due later than tomorrow)."""
+    due_dt = get_due_datetime(task)
+    now = datetime.now()
+    if due_dt - now <= HW_URGENT_WINDOW:
+        return "solid"
+    if due_dt.date() == now.date():
+        return "blink"
+    if due_dt.date() == now.date() + timedelta(days=1):
+        return "blue"
+    return "yellow"
+
+def compute_hardware_light_code(pending: list) -> str:
+    if not pending:
+        return HW_LIGHT_CODE_GREEN
+    urgencies = {get_hardware_urgency(t) for t in pending}
+    for level in HW_LIGHT_PRIORITY:
+        if level in urgencies:
+            return HW_LIGHT_CODE[level]
+    return HW_LIGHT_CODE_GREEN
+
+def hw_due_label(task: dict) -> str:
+    """Compact due label for the 16x2 LCD - always 24h time (independent of
+    the Settings time-format toggle) so it reliably fits the fixed field
+    the Arduino sketch reserves for it."""
+    due_dt = get_due_datetime(task)
+    today = date.today()
+    if due_dt.date() == today:
+        date_part = "Today"
+    elif due_dt.date() == today + timedelta(days=1):
+        date_part = "Tmrw"
+    else:
+        date_part = due_dt.strftime("%m-%d")
+    return f"{date_part} {due_dt.strftime('%H:%M')}"
+
+def sanitize_for_arduino(text: str, max_len: int) -> str:
+    """Strips characters our line protocol can't carry (the '|' field
+    separator and newlines), then trims to the Arduino sketch's fixed
+    16-char field width."""
+    cleaned = (text or "").replace("|", "/").replace("\n", " ").replace("\r", " ")
+    return cleaned[:max_len]
+
 def update_arduino_light() -> None:
-    tiers = [get_tier(t) for t in tasks if not t.get("done")]
-    if "red" in tiers:
-        send_to_arduino("R")
-    elif "yellow" in tiers:
-        send_to_arduino("Y")
-    elif len(tasks) > 0 and all(t.get("done") for t in tasks):
-        send_to_arduino("G")
-    # blue/purple-only tasks don't change the light
+    """Pushes light state, pending count, and the LCD task list to the
+    Arduino. Called after every task add/complete/delete and on resync."""
+    pending = [t for t in tasks if not t.get("done")]
+
+    send_line_to_arduino(f"L:{compute_hardware_light_code(pending)}")
+    send_line_to_arduino(f"C:{min(9999, len(pending))}")
+
+    lcd_tasks = sorted(pending, key=get_due_datetime)[:HW_MAX_LCD_TASKS]
+    send_line_to_arduino(f"N:{len(lcd_tasks)}")
+    for t in lcd_tasks:
+        name = sanitize_for_arduino(t.get("name", "Untitled"), 16)
+        due = sanitize_for_arduino(hw_due_label(t), 16)
+        send_line_to_arduino(f"I:{name}|{due}")
 
 def make_ledger_key(task: dict) -> str:
     name = (task.get("name") or "").strip().lower()
