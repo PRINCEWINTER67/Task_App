@@ -372,10 +372,29 @@ void setup() {
   lcd.noBacklight(); // screen starts OFF until the joystick is clicked
 }
 
+// ---------------- TEMPORARY DEBUG - remove once the joystick works ----------------
+// Prints the joystick's raw readings every 300ms so you can watch them live in
+// the Arduino IDE's Serial Monitor (Tools -> Serial Monitor, or the magnifying
+// glass icon top-right, set to 9600 baud). Close the Python app first, since
+// only one program can have the COM port open at a time.
+unsigned long lastDebugPrint = 0;
+
+void printJoystickDebug() {
+  if (millis() - lastDebugPrint < 300) return;
+  lastDebugPrint = millis();
+  Serial.print("VRx=");
+  Serial.print(analogRead(PIN_JOY_VRX));
+  Serial.print("  VRy=");
+  Serial.print(analogRead(PIN_JOY_VRY));
+  Serial.print("  SW=");
+  Serial.println(digitalRead(PIN_JOY_SW) == LOW ? "PRESSED" : "released");
+}
+
 void loop() {
   readSerialLines();
   updateLight();
   handleJoystickClick();
   handleJoystickTilt();
   updateShutdownMessage();
+  printJoystickDebug();
 }
