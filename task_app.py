@@ -15,9 +15,10 @@ ARDUINO HARDWARE PANEL:
   the hour (or overdue), red blink = due later today, blue = nearest task
   due tomorrow, yellow = nearest task due later than tomorrow, green =
   nothing pending.
-- 16x2 I2C LCD: hold the button for 3 seconds to toggle it on/off. While
-  on, it automatically rotates between a "N pending" summary and each
-  pending task's name + due date.
+- 16x2 I2C LCD, navigated with an analog joystick: click to toggle the
+  screen on/off, up/down moves between tasks (showing each one's name),
+  left shows the total pending count, right shows the selected task's
+  due date.
 See task_light/task_light.ino for the full serial protocol and wiring.
 
 WHAT'S NEW IN THIS VERSION:

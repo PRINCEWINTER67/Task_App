@@ -4,9 +4,11 @@
   Physical control panel for the Task Status Tracker app (task_app.py).
   Drives:
     - 4 status LEDs (red / yellow / blue / green) showing task urgency
-    - a 16x2 I2C LCD that toggles on/off with a long button press, and
-      while on, automatically rotates through a "how many pending"
-      summary screen and each individual pending task
+    - a 16x2 I2C LCD, navigated with an analog joystick module:
+        click        -> toggle the screen on/off
+        up / down    -> move to the previous/next task (shows its name)
+        left         -> show the total pending count
+        right        -> show the currently-selected task's due date
 
   Talks to task_app.py over USB serial at 9600 baud using a tiny
   line-based text protocol (each line ends with '\n'):
@@ -17,7 +19,7 @@
                         2 = BLUE solid  (nearest task due tomorrow)
                         3 = YELLOW solid (nearest task due later than tomorrow)
                         4 = GREEN solid (nothing pending)
-    N:<0-6>          how many task lines follow (resets the LCD's list)
+    N:<0-6>          how many task lines follow (resets the joystick's list)
     I:<name>|<due>   one task line (name + short due label, each already
                       trimmed to <=16 chars by the Python side), sent N
                       times right after an N: line
@@ -25,13 +27,19 @@
   HARDWARE:
     - 4x LED (red/yellow/blue/green) on pins 2-5, each through a
       resistor to GND.
-    - 1x push button on pin 6 (INPUT_PULLUP), other leg to GND.
-    - 1x 16x2 I2C LCD - just 4 wires (GND, VCC, SDA->A4, SCL->A5), no
-      shift register or contrast pot needed, the backpack handles both.
-      Needs the "LiquidCrystal I2C" library (Frank de Brabander)
-      installed via Library Manager. If the screen shows nothing once
-      it's on, try changing LCD_I2C_ADDRESS below from 0x27 to 0x3F -
-      those are the two common backpack addresses.
+    - 1x analog joystick module, wired directly (no breadboard needed):
+      GND->GND, +5V->5V, VRx->A0, VRy->A1, SW->D6 (INPUT_PULLUP).
+    - 1x 16x2 I2C LCD - 4 wires (GND, VCC, SDA->A4, SCL->A5). Needs the
+      "LiquidCrystal I2C" library (Frank de Brabander) installed via
+      Library Manager. Blank screen once it's on? Try changing
+      LCD_I2C_ADDRESS below from 0x27 to 0x3F - the two common backpack
+      addresses.
+
+    NOTE: whether "up" reads as a high or low analog value depends on
+    which way your specific joystick happens to be oriented - if
+    up/down or left/right come out swapped or backwards once you test
+    it, that's a one-line fix in handleJoystick() below (swap the two
+    branches for that axis), not a rewiring issue.
 */
 
 #include <Wire.h>
@@ -42,7 +50,10 @@ const uint8_t PIN_LED_RED    = 2;
 const uint8_t PIN_LED_YELLOW = 3;
 const uint8_t PIN_LED_BLUE   = 4;
 const uint8_t PIN_LED_GREEN  = 5;
-const uint8_t PIN_BUTTON     = 6;   // other leg to GND, uses INPUT_PULLUP
+
+const uint8_t PIN_JOY_SW  = 6;   // joystick click, INPUT_PULLUP
+const uint8_t PIN_JOY_VRX = A0;  // joystick left/right
+const uint8_t PIN_JOY_VRY = A1;  // joystick up/down
 
 #define LCD_I2C_ADDRESS 0x27
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, 16, 2);
@@ -96,15 +107,16 @@ char taskDue[MAX_TASKS][17];
 uint8_t taskCount = 0;
 uint8_t taskFillIndex = 0;
 
-// ---------------- LCD PAGE CYCLING (while the screen is on) ----------------
+// ---------------- LCD VIEW STATE ----------------
 bool screenOn = false;
-uint8_t lcdPageIndex = 0; // 0 = summary, 1..taskCount = that task
-unsigned long lastCycleTime = 0;
-const unsigned long CYCLE_INTERVAL_MS = 2500;
+uint8_t taskIndex = 0;
+
+enum ViewMode { MODE_NAME, MODE_DATE, MODE_COUNT };
+ViewMode viewMode = MODE_NAME;
 
 void drawCurrentPage() {
   lcd.clear();
-  if (lcdPageIndex == 0) {
+  if (viewMode == MODE_COUNT || taskCount == 0) {
     lcd.setCursor(0, 0);
     lcd.print("Task Tracker");
     lcd.setCursor(0, 1);
@@ -115,60 +127,99 @@ void drawCurrentPage() {
       snprintf(line, sizeof(line), "%u pending", (unsigned)taskCount);
       lcd.print(line);
     }
-  } else {
-    uint8_t i = lcdPageIndex - 1;
-    lcd.setCursor(0, 0);
-    lcd.print(taskName[i]);
-    lcd.setCursor(0, 1);
-    lcd.print(taskDue[i]);
+    return;
+  }
+
+  lcd.setCursor(0, 0);
+  lcd.print(taskName[taskIndex]);
+  lcd.setCursor(0, 1);
+  if (viewMode == MODE_DATE) {
+    char line[17];
+    snprintf(line, sizeof(line), "Due: %s", taskDue[taskIndex]);
+    lcd.print(line);
+  } else { // MODE_NAME
+    char line[17];
+    snprintf(line, sizeof(line), "Task %u/%u", (unsigned)(taskIndex + 1), (unsigned)taskCount);
+    lcd.print(line);
   }
 }
 
-void updateLcdCycle() {
-  if (!screenOn) return;
-  if (millis() - lastCycleTime < CYCLE_INTERVAL_MS) return;
-  lastCycleTime = millis();
-  uint8_t totalPages = taskCount + 1; // summary + one per task
-  lcdPageIndex = (lcdPageIndex + 1) % totalPages;
-  drawCurrentPage();
+void redrawIfOn() {
+  if (screenOn) drawCurrentPage();
 }
 
-// ---------------- BUTTON: 3-SECOND LONG PRESS TOGGLES THE SCREEN ----------------
-bool lastButtonReading = HIGH;
-bool buttonState = HIGH;
-unsigned long lastDebounceTime = 0;
+// ---------------- JOYSTICK: click toggles screen, tilt navigates ----------------
+bool lastSwReading = HIGH;
+bool swState = HIGH;
+unsigned long lastSwDebounce = 0;
 const unsigned long DEBOUNCE_MS = 40;
 
-unsigned long pressStartTime = 0;
-bool longPressFired = false;
-const unsigned long LONG_PRESS_MS = 3000;
+const int TILT_LOW = 340;   // below this = tilted toward "low" side
+const int TILT_HIGH = 680;  // above this = tilted toward "high" side
+enum Direction { DIR_NONE, DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
+Direction lastDirection = DIR_NONE;
 
-void handleButton() {
-  bool reading = digitalRead(PIN_BUTTON);
-  if (reading != lastButtonReading) {
-    lastDebounceTime = millis();
+void handleJoystickClick() {
+  bool reading = digitalRead(PIN_JOY_SW);
+  if (reading != lastSwReading) {
+    lastSwDebounce = millis();
   }
-  if (millis() - lastDebounceTime > DEBOUNCE_MS && reading != buttonState) {
-    buttonState = reading;
-    if (buttonState == LOW) { // just pressed (INPUT_PULLUP -> LOW on press)
-      pressStartTime = millis();
-      longPressFired = false;
+  if (millis() - lastSwDebounce > DEBOUNCE_MS && reading != swState) {
+    swState = reading;
+    if (swState == LOW) { // just clicked (INPUT_PULLUP -> LOW on press)
+      screenOn = !screenOn;
+      if (screenOn) {
+        lcd.backlight();
+        taskIndex = 0;
+        viewMode = MODE_NAME;
+        drawCurrentPage();
+      } else {
+        lcd.clear();
+        lcd.noBacklight();
+      }
     }
   }
-  if (buttonState == LOW && !longPressFired && millis() - pressStartTime >= LONG_PRESS_MS) {
-    longPressFired = true;
-    screenOn = !screenOn;
-    if (screenOn) {
-      lcd.backlight();
-      lcdPageIndex = 0;
-      lastCycleTime = millis();
-      drawCurrentPage();
-    } else {
-      lcd.clear();
-      lcd.noBacklight();
+  lastSwReading = reading;
+}
+
+void handleJoystickTilt() {
+  int x = analogRead(PIN_JOY_VRX);
+  int y = analogRead(PIN_JOY_VRY);
+
+  Direction dir = DIR_NONE;
+  if (y < TILT_LOW) dir = DIR_UP;
+  else if (y > TILT_HIGH) dir = DIR_DOWN;
+  else if (x < TILT_LOW) dir = DIR_LEFT;
+  else if (x > TILT_HIGH) dir = DIR_RIGHT;
+
+  // Only act on the moment the stick moves from centered into a
+  // direction - not continuously while held over, so one tilt = one step.
+  if (dir != DIR_NONE && lastDirection == DIR_NONE) {
+    switch (dir) {
+      case DIR_UP:
+        if (taskCount > 0) {
+          taskIndex = (taskIndex == 0) ? taskCount - 1 : taskIndex - 1;
+          viewMode = MODE_NAME;
+        }
+        break;
+      case DIR_DOWN:
+        if (taskCount > 0) {
+          taskIndex = (taskIndex + 1) % taskCount;
+          viewMode = MODE_NAME;
+        }
+        break;
+      case DIR_LEFT:
+        viewMode = MODE_COUNT;
+        break;
+      case DIR_RIGHT:
+        viewMode = MODE_DATE;
+        break;
+      default:
+        break;
     }
+    redrawIfOn();
   }
-  lastButtonReading = reading;
+  lastDirection = dir;
 }
 
 // ---------------- SERIAL PROTOCOL ----------------
@@ -190,11 +241,8 @@ void applyLine(char *line) {
     if (v > MAX_TASKS) v = MAX_TASKS;
     taskCount = (uint8_t)v;
     taskFillIndex = 0;
-    if (screenOn) {
-      lcdPageIndex = 0;
-      lastCycleTime = millis();
-      drawCurrentPage();
-    }
+    taskIndex = 0;
+    redrawIfOn();
   } else if (line[0] == 'I' && line[1] == ':') {
     if (taskFillIndex < taskCount) {
       char *rest = line + 2;
@@ -242,15 +290,15 @@ void setup() {
   pinMode(PIN_LED_GREEN, OUTPUT);
   setAllLedsOff();
 
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_JOY_SW, INPUT_PULLUP);
 
   lcd.init();
-  lcd.noBacklight(); // screen starts OFF until the button is held 3s
+  lcd.noBacklight(); // screen starts OFF until the joystick is clicked
 }
 
 void loop() {
   readSerialLines();
   updateLight();
-  handleButton();
-  updateLcdCycle();
+  handleJoystickClick();
+  handleJoystickTilt();
 }
