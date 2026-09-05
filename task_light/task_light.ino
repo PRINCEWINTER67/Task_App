@@ -5,10 +5,17 @@
   Drives:
     - 4 status LEDs (red / yellow / blue / green) showing task urgency
     - a 16x2 I2C LCD, navigated with an analog joystick module:
-        click        -> toggle the screen on/off
-        up / down    -> move to the previous/next task (shows its name)
-        left         -> show the total pending count
-        right        -> show the currently-selected task's due date
+        click (short)  -> toggle the screen on/off. This never changes
+                           when the lights themselves are due to switch -
+                           it only shows/hides the screen.
+        click (5s hold) -> full shutdown: LCD shows "SHUT DOWN" for 5s
+                           then goes dark, and every LED forces off too,
+                           even if a task would otherwise light one up.
+                           Holding it again for 5s wakes everything back
+                           up to its current real status immediately.
+        up / down      -> move to the previous/next task (shows its name)
+        left           -> show the total pending count
+        right          -> show the currently-selected task's due date
 
   Talks to task_app.py over USB serial at 9600 baud using a tiny
   line-based text protocol (each line ends with '\n'):
@@ -64,6 +71,11 @@ unsigned long lastBlinkToggle = 0;
 bool blinkOn = false;
 const unsigned long BLINK_INTERVAL_MS = 500;
 
+// Full shutdown override (5-second joystick hold) - forces LEDs off and
+// the LCD dark regardless of lightState/screenOn, without changing
+// either of those, so waking up resumes exactly where things really are.
+bool systemShutdown = false;
+
 void setAllLedsOff() {
   digitalWrite(PIN_LED_RED, LOW);
   digitalWrite(PIN_LED_YELLOW, LOW);
@@ -72,6 +84,10 @@ void setAllLedsOff() {
 }
 
 void updateLight() {
+  if (systemShutdown) {
+    setAllLedsOff();
+    return;
+  }
   switch (lightState) {
     case 0: // red solid - due within the hour, or overdue
       setAllLedsOff();
@@ -148,11 +164,50 @@ void redrawIfOn() {
   if (screenOn) drawCurrentPage();
 }
 
-// ---------------- JOYSTICK: click toggles screen, tilt navigates ----------------
+// ---------------- SHUTDOWN (5-second joystick hold) ----------------
+bool shutdownMessageActive = false;
+unsigned long shutdownMessageStart = 0;
+const unsigned long SHUTDOWN_MESSAGE_MS = 5000;
+
+void enterShutdown() {
+  systemShutdown = true;
+  shutdownMessageActive = true;
+  shutdownMessageStart = millis();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SHUT DOWN");
+}
+
+void exitShutdown() {
+  systemShutdown = false;
+  shutdownMessageActive = false;
+  if (screenOn) {
+    lcd.backlight();
+    drawCurrentPage();
+  } else {
+    lcd.noBacklight();
+  }
+}
+
+void updateShutdownMessage() {
+  if (shutdownMessageActive && millis() - shutdownMessageStart >= SHUTDOWN_MESSAGE_MS) {
+    shutdownMessageActive = false;
+    lcd.clear();
+    lcd.noBacklight();
+  }
+}
+
+// ---------------- JOYSTICK: short click toggles screen, 5s hold
+// toggles shutdown, tilt navigates ----------------
 bool lastSwReading = HIGH;
 bool swState = HIGH;
 unsigned long lastSwDebounce = 0;
 const unsigned long DEBOUNCE_MS = 40;
+
+unsigned long pressStartTime = 0;
+bool longPressFired = false;
+const unsigned long LONG_PRESS_MS = 5000;
 
 const int TILT_LOW = 340;   // below this = tilted toward "low" side
 const int TILT_HIGH = 680;  // above this = tilted toward "high" side
@@ -166,17 +221,31 @@ void handleJoystickClick() {
   }
   if (millis() - lastSwDebounce > DEBOUNCE_MS && reading != swState) {
     swState = reading;
-    if (swState == LOW) { // just clicked (INPUT_PULLUP -> LOW on press)
-      screenOn = !screenOn;
-      if (screenOn) {
-        lcd.backlight();
-        taskIndex = 0;
-        viewMode = MODE_NAME;
-        drawCurrentPage();
-      } else {
-        lcd.clear();
-        lcd.noBacklight();
+    if (swState == LOW) { // just pressed (INPUT_PULLUP -> LOW on press)
+      pressStartTime = millis();
+      longPressFired = false;
+    } else { // just released
+      if (!longPressFired && !systemShutdown) {
+        // short click - toggle the screen only, lights are untouched
+        screenOn = !screenOn;
+        if (screenOn) {
+          lcd.backlight();
+          taskIndex = 0;
+          viewMode = MODE_NAME;
+          drawCurrentPage();
+        } else {
+          lcd.clear();
+          lcd.noBacklight();
+        }
       }
+    }
+  }
+  if (swState == LOW && !longPressFired && millis() - pressStartTime >= LONG_PRESS_MS) {
+    longPressFired = true;
+    if (systemShutdown) {
+      exitShutdown();
+    } else {
+      enterShutdown();
     }
   }
   lastSwReading = reading;
@@ -191,6 +260,13 @@ void handleJoystickTilt() {
   else if (y > TILT_HIGH) dir = DIR_DOWN;
   else if (x < TILT_LOW) dir = DIR_LEFT;
   else if (x > TILT_HIGH) dir = DIR_RIGHT;
+
+  if (systemShutdown) {
+    // Keep tracking the tilt so a held direction doesn't fire a
+    // surprise step the instant the system wakes back up.
+    lastDirection = dir;
+    return;
+  }
 
   // Only act on the moment the stick moves from centered into a
   // direction - not continuously while held over, so one tilt = one step.
@@ -301,4 +377,5 @@ void loop() {
   updateLight();
   handleJoystickClick();
   handleJoystickTilt();
+  updateShutdownMessage();
 }
