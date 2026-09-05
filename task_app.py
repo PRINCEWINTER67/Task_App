@@ -15,8 +15,9 @@ ARDUINO HARDWARE PANEL:
   the hour (or overdue), red blink = due later today, blue = nearest task
   due tomorrow, yellow = nearest task due later than tomorrow, green =
   nothing pending.
-- Single-digit 7-segment display, wired directly to the Arduino (no shift
-  register): live count of pending (not-done) tasks, capped at "9".
+- 16x2 I2C LCD: hold the button for 3 seconds to toggle it on/off. While
+  on, it automatically rotates between a "N pending" summary and each
+  pending task's name + due date.
 See task_light/task_light.ino for the full serial protocol and wiring.
 
 WHAT'S NEW IN THIS VERSION:
@@ -499,12 +500,13 @@ def send_line_to_arduino(line: str) -> None:
     send_to_arduino(line + "\n")
 
 # ============================================================
-# ARDUINO HARDWARE PANEL (4 status LEDs + a single-digit counter)
+# ARDUINO HARDWARE PANEL (4 status LEDs + a button-toggled I2C LCD)
 # Separate from the on-screen urgency tiers (get_tier/TIER_COLORS) above -
 # the physical light escalates by literal time-to-due rather than the
 # app's day-bucketed dots, so "due within the hour" can outrank "due
 # today" even though both would show as the same red dot on screen.
 # ============================================================
+HW_MAX_LCD_TASKS = 6
 HW_URGENT_WINDOW = timedelta(hours=1)
 HW_LIGHT_PRIORITY = ["solid", "blink", "blue", "yellow"]  # first match wins
 HW_LIGHT_CODE = {"solid": "0", "blink": "1", "blue": "2", "yellow": "3"}
@@ -533,13 +535,42 @@ def compute_hardware_light_code(pending: list) -> str:
             return HW_LIGHT_CODE[level]
     return HW_LIGHT_CODE_GREEN
 
+def hw_due_label(task: dict) -> str:
+    """Compact due label for the 16x2 LCD - always 24h time (independent of
+    the Settings time-format toggle) so it reliably fits the fixed field
+    the Arduino sketch reserves for it."""
+    due_dt = get_due_datetime(task)
+    today = date.today()
+    if due_dt.date() == today:
+        date_part = "Today"
+    elif due_dt.date() == today + timedelta(days=1):
+        date_part = "Tmrw"
+    else:
+        date_part = due_dt.strftime("%m-%d")
+    return f"{date_part} {due_dt.strftime('%H:%M')}"
+
+def sanitize_for_arduino(text: str, max_len: int) -> str:
+    """Strips characters our line protocol can't carry (the '|' field
+    separator and newlines), then trims to the Arduino sketch's fixed
+    16-char field width."""
+    cleaned = (text or "").replace("|", "/").replace("\n", " ").replace("\r", " ")
+    return cleaned[:max_len]
+
 def update_arduino_light() -> None:
-    """Pushes light state and pending count to the Arduino. Called after
-    every task add/complete/delete and on resync. The Arduino sketch has
-    no LCD/button on this build, so only L: and C: are sent."""
+    """Pushes light state and the LCD task list to the Arduino. Called
+    after every task add/complete/delete and on resync. There's no
+    7-segment counter on this build, so no C: line is sent - the LCD's
+    own summary page shows the pending count instead."""
     pending = [t for t in tasks if not t.get("done")]
 
     send_line_to_arduino(f"L:{compute_hardware_light_code(pending)}")
+
+    lcd_tasks = sorted(pending, key=get_due_datetime)[:HW_MAX_LCD_TASKS]
+    send_line_to_arduino(f"N:{len(lcd_tasks)}")
+    for t in lcd_tasks:
+        name = sanitize_for_arduino(t.get("name", "Untitled"), 16)
+        due = sanitize_for_arduino(hw_due_label(t), 16)
+        send_line_to_arduino(f"I:{name}|{due}")
     send_line_to_arduino(f"C:{min(9999, len(pending))}")
 
 def make_ledger_key(task: dict) -> str:
